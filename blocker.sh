@@ -89,14 +89,14 @@ save_iptables() {
   fi
 }
 
-# === Block port ===
+# === Block port with WireGuard exception ===
 block_port() {
   local PORT=$1
   local PROTO=$2
   echo "[+] Blocking non-ID for port $PORT/$PROTO ..."
-  iptables -I INPUT -p $PROTO --dport $PORT -m set ! --match-set indonesia src -j DROP
+  iptables -I INPUT -p $PROTO --dport $PORT -m set ! --match-set indonesia src ! -i wg0 -j DROP
   save_iptables
-  echo "[✓] Rule added and saved."
+  echo "[✓] Rule added and saved (WireGuard exempted)."
 }
 
 # === Remove rules ===
@@ -104,7 +104,7 @@ remove_rules() {
   echo "[+] Removing GeoIP blocking rules..."
   for port in 53 853; do
     for proto in tcp udp; do
-      iptables -D INPUT -p $proto --dport $port -m set ! --match-set indonesia src -j DROP 2>/dev/null || true
+      iptables -D INPUT -p $proto --dport $port -m set ! --match-set indonesia src ! -i wg0 -j DROP 2>/dev/null || true
     done
   done
   save_iptables
