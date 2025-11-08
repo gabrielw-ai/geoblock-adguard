@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 # ========================================================
-# GeoIP Firewall Manager (MaxMind CSV Manual)
+# GeoIP Firewall Manager (Auto Setup)
 # Author: Gabriel + Copilot
-# Description: Block non-Indonesian IPs on specific ports
 # ========================================================
 
 set -e
 
 # === Detect Distro ===
-if [ -f /etc/redhat-release ]; then
-  DISTRO="rhel"
-  PKG_MGR="yum"
-elif [ -f /etc/debian_version ]; then
-  DISTRO="debian"
-  PKG_MGR="apt"
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+  DISTRO=$ID
+  PKG_MGR=$(command -v dnf || command -v yum || command -v apt || echo "unknown")
 else
   echo "Unsupported distro. Exiting."
   exit 1
@@ -29,35 +26,49 @@ fi
 
 # === Install dependencies ===
 echo "[+] Installing required packages..."
-$PKG_MGR install -y ipset unzip python3 jq net-tools
+$PKG_MGR install -y ipset unzip python3 jq net-tools curl git
 
-# === Prepare CSV ===
+# === Setup geo-block repo ===
+REPO_DIR="/root/geo-block"
+if [ ! -d "$REPO_DIR" ]; then
+  echo "[+] Cloning geo-block repo..."
+  git clone https://github.com/gabrielw-ai/geo-block "$REPO_DIR"
+else
+  echo "[=] geo-block repo already exists."
+fi
+
+# === Locate ZIP file ===
+ZIP_FILE="$REPO_DIR/geolite.zip"
+if [ ! -f "$ZIP_FILE" ]; then
+  echo "[!] File geolite.zip not found in $REPO_DIR. Please download it manually."
+  exit 1
+fi
+
+# === Setup paths ===
 MMDB_DIR="/etc/ipset"
 CIDR_FILE="$MMDB_DIR/id.cidr"
-PY_SCRIPT="/root/extract_id_cidr.py"
-ZIP_FILE="/root/geolite/geolite.zip"
+PY_SCRIPT="$REPO_DIR/extract_id_cidr.py"
 
 mkdir -p "$MMDB_DIR"
 
-if [ ! -f "$ZIP_FILE" ]; then
-  echo "[!] GeoLite2-Country CSV ZIP not found at $ZIP_FILE. Please download it manually."
-  exit 1
+# === Extract CSV only if CIDR not yet parsed ===
+if [ ! -f "$CIDR_FILE" ]; then
+  echo "[+] Extracting CSV from ZIP..."
+  unzip -o "$ZIP_FILE" -d "$MMDB_DIR"
+  mv "$MMDB_DIR"/GeoLite2-Country-CSV_*/GeoLite2-Country-Blocks-IPv4.csv "$MMDB_DIR"/
+  mv "$MMDB_DIR"/GeoLite2-Country-CSV_*/GeoLite2-Country-Locations-en.csv "$MMDB_DIR"/
+
+  # === Validate CSV files ===
+  if [ ! -f "$MMDB_DIR/GeoLite2-Country-Blocks-IPv4.csv" ] || [ ! -f "$MMDB_DIR/GeoLite2-Country-Locations-en.csv" ]; then
+    echo "[!] Required CSV files not found in $MMDB_DIR. Aborting."
+    exit 1
+  fi
+
+  echo "[+] Parsing Indonesia CIDR from CSV..."
+  python3 "$PY_SCRIPT"
+else
+  echo "[=] CIDR file already exists. Skipping extraction and parsing."
 fi
-
-echo "[+] Extracting CSV from ZIP..."
-unzip -o "$ZIP_FILE" -d "$MMDB_DIR"
-mv "$MMDB_DIR"/GeoLite2-Country-CSV_*/GeoLite2-Country-Blocks-IPv4.csv "$MMDB_DIR"/
-mv "$MMDB_DIR"/GeoLite2-Country-CSV_*/GeoLite2-Country-Locations-en.csv "$MMDB_DIR"/
-
-# === Validate CSV files ===
-if [ ! -f "$MMDB_DIR/GeoLite2-Country-Blocks-IPv4.csv" ] || [ ! -f "$MMDB_DIR/GeoLite2-Country-Locations-en.csv" ]; then
-  echo "[!] Required CSV files not found in $MMDB_DIR. Aborting."
-  exit 1
-fi
-
-# === Extract CIDR for Indonesia ===
-echo "[+] Parsing Indonesia CIDR from CSV..."
-python3 "$PY_SCRIPT"
 
 # === Get public IP ===
 MYIP=$(curl -s https://ipinfo.io/ip)
@@ -82,10 +93,13 @@ create_ipset() {
 # === Save iptables ===
 save_iptables() {
   echo "[+] Saving iptables rules..."
-  if [ "$DISTRO" = "rhel" ]; then
-    service iptables save
-  else
+  if command -v netfilter-persistent &>/dev/null; then
     netfilter-persistent save
+  elif command -v iptables-save &>/dev/null; then
+    iptables-save > /etc/sysconfig/iptables
+    systemctl restart iptables || echo "[!] iptables service not managed by systemctl"
+  else
+    echo "[!] Could not determine how to save iptables rules."
   fi
 }
 
@@ -101,11 +115,9 @@ block_port() {
 
 # === Remove rules ===
 remove_rules() {
-  echo "[+] Removing GeoIP blocking rules..."
-  for port in 53 853; do
-    for proto in tcp udp; do
-      iptables -D INPUT -p $proto --dport $port -m set ! --match-set indonesia src ! -i wg0 -j DROP 2>/dev/null || true
-    done
+  echo "[+] Removing all GeoIP rules from INPUT chain..."
+  iptables -L INPUT -n --line-numbers | grep match-set | awk '{print $1}' | sort -r | while read num; do
+    iptables -D INPUT "$num"
   done
   save_iptables
   echo "[✓] All GeoIP rules removed."
