@@ -96,12 +96,23 @@ save_iptables() {
   if command -v netfilter-persistent &>/dev/null; then
     netfilter-persistent save
   elif command -v iptables-save &>/dev/null; then
-    iptables-save > /etc/sysconfig/iptables
-    systemctl restart iptables || echo "[!] iptables service not managed by systemctl"
+    if [ -f /etc/sysconfig/iptables ]; then
+      # RHEL/Fedora
+      iptables-save > /etc/sysconfig/iptables
+      systemctl restart iptables || echo "[!] iptables service not managed by systemctl"
+    elif [ -d /etc/iptables ]; then
+      # Ubuntu/Debian
+      iptables-save > /etc/iptables/rules.v4
+      ip6tables-save > /etc/iptables/rules.v6
+      systemctl restart netfilter-persistent || echo "[!] netfilter-persistent not managed by systemctl"
+    else
+      echo "[!] Could not determine where to save iptables rules."
+    fi
   else
     echo "[!] Could not determine how to save iptables rules."
   fi
 }
+
 
 # === Block port with WireGuard exception ===
 block_port() {
