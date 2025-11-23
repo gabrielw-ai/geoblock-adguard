@@ -1,195 +1,226 @@
 #!/usr/bin/env bash
 # ========================================================
-# GeoIP Firewall Manager (Auto Setup)
-# Improved Version
+# GeoIP Country Blocker (Indonesia Only) - Simple Version
+# Author: Gabriel + ChatGPT
+# Debian + RHEL compatible
 # ========================================================
 
-set -e
+set -euo pipefail
 
-# === Detect Distro ===
+# Colors
+GREEN="\e[32m"
+YELLOW="\e[33m"
+RED="\e[31m"
+NC="\e[0m"
+
+# Detect distro
 if [ -f /etc/os-release ]; then
-  . /etc/os-release
-  DISTRO=$ID
-  PKG_MGR=$(command -v dnf || command -v yum || command -v apt || echo "unknown")
+    . /etc/os-release
+    DISTRO=$ID
 else
-  echo "Unsupported distro. Exiting."
-  exit 1
-fi
-
-echo "Detected distro: $DISTRO"
-
-# === Ensure root ===
-if [ "$EUID" -ne 0 ]; then
-  echo "Please run as root."
-  exit 1
-fi
-
-# === Install dependencies ===
-echo "[+] Installing required packages..."
-$PKG_MGR install -y ipset unzip python3 jq net-tools curl
-
-# Debian needs iptables-persistent for saving rules
-if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
-  $PKG_MGR install -y iptables-persistent
-fi
-
-# === Setup repo directory ===
-REPO_DIR="$(pwd)"
-ZIP_FILE="$REPO_DIR/GeoLite2-Country-CSV.zip"
-
-if [ ! -f "$ZIP_FILE" ]; then
-  echo "[!] Missing GeoLite2-Country-CSV.zip in repo folder!"
-  echo "    Make sure you downloaded the complete geoblock-adguard package."
-  exit 1
-fi
-
-# === Setup paths ===
-MMDB_DIR="/etc/ipset"
-CIDR_FILE="$MMDB_DIR/id.cidr"
-PY_SCRIPT="$REPO_DIR/extract_id_cidr.py"
-
-mkdir -p "$MMDB_DIR"
-
-# === Extract only once ===
-if [ ! -f "$CIDR_FILE" ]; then
-  echo "[+] Extracting GeoLite2-Country-CSV.zip..."
-  unzip -o "$ZIP_FILE" -d "$MMDB_DIR"
-
-  # Find extracted folder
-  CSV_FOLDER=$(find "$MMDB_DIR" -maxdepth 1 -type d -name "GeoLite2-Country-CSV_*" | head -n 1)
-  if [ -z "$CSV_FOLDER" ]; then
-    echo "[!] Unable to find extracted GeoLite2-Country-CSV folder."
+    echo -e "${RED}Cannot detect OS!${NC}"
     exit 1
-  fi
-
-  echo "[+] Found CSV folder: $CSV_FOLDER"
-
-  # Move only the needed files
-  mv "$CSV_FOLDER/GeoLite2-Country-Blocks-IPv4.csv" "$MMDB_DIR"
-  mv "$CSV_FOLDER/GeoLite2-Country-Locations-en.csv" "$MMDB_DIR"
-
-  echo "[+] Parsing Indonesia CIDR..."
-  python3 "$PY_SCRIPT"
-else
-  echo "[=] CIDR already exists. Skipping extraction."
 fi
 
-# === Get public IP ===
-MYIP=$(curl -s https://ipinfo.io/ip)
-echo "[+] Server public IP: $MYIP"
+echo -e "${GREEN}Detected distro: $DISTRO${NC}"
 
-# === Create IPSET ===
-create_ipset() {
-  if ! ipset list indonesia &>/dev/null; then
-    echo "[+] Creating IP set for Indonesia..."
-    ipset create indonesia hash:net
-    for i in $(cat "$CIDR_FILE"); do ipset add indonesia "$i"; done
-  else
-    echo "[=] IP set 'indonesia' already exists."
-  fi
+# Ensure root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Please run as root.${NC}"
+    exit 1
+fi
 
-  if ! ipset test indonesia "$MYIP" &>/dev/null; then
-    echo "[!] Public IP $MYIP not in Indonesia list — adding..."
-    ipset add indonesia "$MYIP"
-  fi
+# Select package manager
+if command -v dnf >/dev/null 2>&1; then
+    PKG=dnf
+elif command -v yum >/dev/null 2>&1; then
+    PKG=yum
+elif command -v apt >/dev/null 2>&1; then
+    PKG=apt
+else
+    echo -e "${RED}No supported package manager found.${NC}"
+    exit 1
+fi
+
+# Install deps
+echo -e "${YELLOW}[+] Installing dependencies...${NC}"
+if [[ "$PKG" == "apt" ]]; then
+    apt update -y
+    apt install -y ipset unzip python3 jq curl iptables-persistent
+else
+    $PKG install -y ipset unzip python3 jq curl
+fi
+
+# Main directory (where script runs)
+BASE_DIR="$(pwd)"
+
+# Detect GeoLite2 ZIP
+ZIP_FILE=$(ls "$BASE_DIR"/GeoLite2-Country-CSV_*.zip 2>/dev/null | head -n 1 || true)
+
+if [ -z "$ZIP_FILE" ]; then
+    echo -e "${RED}[!] GeoLite2-Country-CSV_*.zip not found in $BASE_DIR${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}[+] Found ZIP: $ZIP_FILE${NC}"
+
+# Extract files
+echo -e "${YELLOW}[+] Extracting...${NC}"
+
+mkdir -p "$BASE_DIR/geo"
+unzip -o "$ZIP_FILE" -d "$BASE_DIR/geo"
+
+CSV_DIR=$(find "$BASE_DIR/geo" -maxdepth 1 -type d -name "GeoLite2-Country-CSV_*" | head -n 1)
+
+if [ -z "$CSV_DIR" ]; then
+    echo -e "${RED}[!] Extraction failed.${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}[+] CSV DIR: $CSV_DIR${NC}"
+
+# Run python extractor
+CIDR_DIR="/etc/ipset"
+CIDR_FILE="$CIDR_DIR/id.cidr"
+mkdir -p "$CIDR_DIR"
+
+echo -e "${YELLOW}[+] Generating CIDR for Indonesia...${NC}"
+python3 "$BASE_DIR/extract_id_cidr.py"
+
+if [ ! -f "$CIDR_FILE" ]; then
+    echo -e "${RED}[!] Failed to generate CIDR file!${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}[✓] CIDR saved to $CIDR_FILE${NC}"
+
+# Prepare ipset
+setup_ipset() {
+    echo -e "${YELLOW}[+] Preparing ipset 'indonesia'...${NC}"
+
+    if ipset list indonesia >/dev/null 2>&1; then
+        echo "[=] ipset exists → flushing..."
+        ipset flush indonesia
+    else
+        echo "[+] Creating new ipset..."
+        ipset create indonesia hash:net maxelem 1000000
+    fi
+
+    echo "[+] Loading CIDR..."
+    while read -r cidr; do
+        ipset add indonesia "$cidr"
+    done < "$CIDR_FILE"
+
+    echo -e "${GREEN}[✓] ipset 'indonesia' ready.${NC}"
 }
 
-# === Save iptables (FIXED permanent save) ===
+# Save iptables permanent
 save_iptables() {
-  echo "[+] Saving iptables..."
+    echo -e "${YELLOW}[+] Saving iptables...${NC}"
 
-  if command -v netfilter-persistent &>/dev/null; then
-    netfilter-persistent save
+    if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
+        iptables-save > /etc/iptables/rules.v4
+        ip6tables-save > /etc/iptables/rules.v6
+        systemctl restart netfilter-persistent || true
 
-  elif [[ -d /etc/iptables ]]; then
-    mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4
-    ip6tables-save > /etc/iptables/rules.v6
+    elif [[ "$DISTRO" == "almalinux" || "$DISTRO" == "rocky" || "$DISTRO" == "centos" || "$DISTRO" == "rhel" ]]; then
+        iptables-save > /etc/sysconfig/iptables
+        systemctl restart iptables || true
+    fi
 
-  elif [[ -f /etc/sysconfig ]]; then
-    iptables-save > /etc/sysconfig/iptables
-
-  else
-    echo "[!] Could not find standard save location!"
-  fi
-
-  echo "[✓] iptables saved."
+    echo -e "${GREEN}[✓] iptables persisted.${NC}"
 }
 
-# === Add blocking rule ===
+# Blocking function
 block_port() {
-  local PORT=$1
-  local PROTO=$2
-  echo "[+] Blocking non-ID access for $PORT/$PROTO..."
-  iptables -I INPUT -p $PROTO --dport $PORT -m set ! --match-set indonesia src ! -i wg0 -j DROP
-  save_iptables
+    PORT="$1"
+    PROTO="$2"
+
+    echo -e "${YELLOW}[+] Blocking non-ID for port $PORT/$PROTO ...${NC}"
+
+    iptables -I INPUT -p "$PROTO" --dport "$PORT" -m set ! --match-set indonesia src -j DROP
+
+    save_iptables
+
+    echo -e "${GREEN}[✓] Blocking applied.${NC}"
 }
 
-# === Remove rules ===
+# Remove rules
 remove_rules() {
-  echo "[+] Removing all GeoIP rules..."
-  iptables -L INPUT -n --line-numbers | grep match-set | awk '{print $1}' | sort -r | while read num; do
-    iptables -D INPUT "$num"
-  done
-  save_iptables
-  echo "[✓] Removed."
+    echo -e "${YELLOW}[+] Removing all GeoIP rules...${NC}"
+
+    iptables -L INPUT -n --line-numbers \
+        | grep match-set \
+        | awk '{print $1}' \
+        | sort -rn \
+        | while read -r num; do
+            iptables -D INPUT "$num"
+        done
+
+    save_iptables
+
+    echo -e "${GREEN}[✓] All GeoIP rules removed.${NC}"
 }
 
-# === Check rules ===
+# Check rules
 check_rules() {
-  echo "[+] Current rules:"
-  iptables -L INPUT -n --line-numbers | grep match-set || echo "No rules."
+    echo -e "${YELLOW}===== IPTABLES RULES =====${NC}"
+    iptables -L INPUT -n --line-numbers | grep -E "match-set|DROP" || echo "No blocking rules."
+    echo ""
+    read -p "Press Enter..."
 }
 
-# === Menu ===
-create_ipset
+# Initialize ipset on startup
+setup_ipset
 
+# Menu loop
 while true; do
-  clear
-  echo "=============================="
-  echo " GEOIP FIREWALL MANAGER "
-  echo "=============================="
-  echo "1) Block non-ID port 53"
-  echo "2) Block non-ID port 853"
-  echo "3) Block both 53 & 853"
-  echo "4) Block custom port"
-  echo "5) Check rules"
-  echo "6) Remove all rules"
-  echo "7) Exit"
-  echo "=============================="
-  read -p "Choose [1-7]: " choice
+    clear
+    echo -e "${GREEN}=============================="
+    echo " GEO BLOCKER - INDONESIA ONLY "
+    echo "==============================${NC}"
+    echo "1. Block non-ID port 53"
+    echo "2. Block non-ID port 853"
+    echo "3. Block both (53 + 853)"
+    echo "4. Block custom port"
+    echo "5. Check blocking"
+    echo "6. Remove blocking"
+    echo "7. Exit"
+    echo ""
 
-  case $choice in
-    1)
-      block_port 53 tcp
-      block_port 53 udp
-      ;;
-    2)
-      block_port 853 tcp
-      ;;
-    3)
-      block_port 53 tcp
-      block_port 53 udp
-      block_port 853 tcp
-      ;;
-    4)
-      read -p "Port: " port
-      read -p "Protocol (tcp/udp): " proto
-      block_port $port $proto
-      ;;
-    5)
-      check_rules
-      read -p "Press Enter..."
-      ;;
-    6)
-      remove_rules
-      ;;
-    7)
-      exit 0
-      ;;
-    *)
-      echo "Invalid choice."
-      sleep 1
-      ;;
-  esac
+    read -p "Choose: " opt
+
+    case "$opt" in
+        1)
+            block_port 53 tcp
+            block_port 53 udp
+            ;;
+        2)
+            block_port 853 tcp
+            ;;
+        3)
+            block_port 53 tcp
+            block_port 53 udp
+            block_port 853 tcp
+            ;;
+        4)
+            read -p "Port: " p
+            read -p "Protocol (tcp/udp): " pr
+            block_port "$p" "$pr"
+            ;;
+        5)
+            check_rules
+            ;;
+        6)
+            remove_rules
+            ;;
+        7)
+            echo -e "${GREEN}Bye!${NC}"
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Invalid option!${NC}"
+            sleep 1
+            ;;
+    esac
 done
