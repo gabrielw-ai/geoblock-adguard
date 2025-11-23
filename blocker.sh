@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ========================================================
 # GeoIP Firewall Manager (Auto Setup)
-# Author: Gabriel + Copilot
+# Improved Version
 # ========================================================
 
 set -e
@@ -26,21 +26,20 @@ fi
 
 # === Install dependencies ===
 echo "[+] Installing required packages..."
-$PKG_MGR install -y ipset unzip python3 jq net-tools curl git
+$PKG_MGR install -y ipset unzip python3 jq net-tools curl
 
-# === Setup geo-block repo ===
-REPO_DIR="/root/geo-block"
-if [ ! -d "$REPO_DIR" ]; then
-  echo "[+] Cloning geo-block repo..."
-  git clone https://github.com/gabrielw-ai/geo-block "$REPO_DIR"
-else
-  echo "[=] geo-block repo already exists."
+# Debian needs iptables-persistent for saving rules
+if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
+  $PKG_MGR install -y iptables-persistent
 fi
 
-# === Locate ZIP file ===
-ZIP_FILE="$REPO_DIR/geolite.zip"
+# === Setup repo directory ===
+REPO_DIR="$(pwd)"
+ZIP_FILE="$REPO_DIR/GeoLite2-Country-CSV.zip"
+
 if [ ! -f "$ZIP_FILE" ]; then
-  echo "[!] File geolite.zip not found in $REPO_DIR. Please download it manually."
+  echo "[!] Missing GeoLite2-Country-CSV.zip in repo folder!"
+  echo "    Make sure you downloaded the complete geoblock-adguard package."
   exit 1
 fi
 
@@ -51,23 +50,28 @@ PY_SCRIPT="$REPO_DIR/extract_id_cidr.py"
 
 mkdir -p "$MMDB_DIR"
 
-# === Extract CSV only if CIDR not yet parsed ===
+# === Extract only once ===
 if [ ! -f "$CIDR_FILE" ]; then
-  echo "[+] Extracting CSV from ZIP..."
+  echo "[+] Extracting GeoLite2-Country-CSV.zip..."
   unzip -o "$ZIP_FILE" -d "$MMDB_DIR"
-  mv "$MMDB_DIR"/GeoLite2-Country-CSV_*/GeoLite2-Country-Blocks-IPv4.csv "$MMDB_DIR"/
-  mv "$MMDB_DIR"/GeoLite2-Country-CSV_*/GeoLite2-Country-Locations-en.csv "$MMDB_DIR"/
 
-  # === Validate CSV files ===
-  if [ ! -f "$MMDB_DIR/GeoLite2-Country-Blocks-IPv4.csv" ] || [ ! -f "$MMDB_DIR/GeoLite2-Country-Locations-en.csv" ]; then
-    echo "[!] Required CSV files not found in $MMDB_DIR. Aborting."
+  # Find extracted folder
+  CSV_FOLDER=$(find "$MMDB_DIR" -maxdepth 1 -type d -name "GeoLite2-Country-CSV_*" | head -n 1)
+  if [ -z "$CSV_FOLDER" ]; then
+    echo "[!] Unable to find extracted GeoLite2-Country-CSV folder."
     exit 1
   fi
 
-  echo "[+] Parsing Indonesia CIDR from CSV..."
+  echo "[+] Found CSV folder: $CSV_FOLDER"
+
+  # Move only the needed files
+  mv "$CSV_FOLDER/GeoLite2-Country-Blocks-IPv4.csv" "$MMDB_DIR"
+  mv "$CSV_FOLDER/GeoLite2-Country-Locations-en.csv" "$MMDB_DIR"
+
+  echo "[+] Parsing Indonesia CIDR..."
   python3 "$PY_SCRIPT"
 else
-  echo "[=] CIDR file already exists. Skipping extraction and parsing."
+  echo "[=] CIDR already exists. Skipping extraction."
 fi
 
 # === Get public IP ===
@@ -85,62 +89,59 @@ create_ipset() {
   fi
 
   if ! ipset test indonesia "$MYIP" &>/dev/null; then
-    echo "[!] Public IP $MYIP not in Indonesia set. Adding manually..."
+    echo "[!] Public IP $MYIP not in Indonesia list — adding..."
     ipset add indonesia "$MYIP"
   fi
 }
 
-# === Save iptables ===
+# === Save iptables (FIXED permanent save) ===
 save_iptables() {
-  echo "[+] Saving iptables rules..."
+  echo "[+] Saving iptables..."
+
   if command -v netfilter-persistent &>/dev/null; then
     netfilter-persistent save
-  elif command -v iptables-save &>/dev/null; then
-    if [ -f /etc/sysconfig/iptables ]; then
-      # RHEL/Fedora
-      iptables-save > /etc/sysconfig/iptables
-      systemctl restart iptables || echo "[!] iptables service not managed by systemctl"
-    elif [ -d /etc/iptables ]; then
-      # Ubuntu/Debian
-      iptables-save > /etc/iptables/rules.v4
-      ip6tables-save > /etc/iptables/rules.v6
-      systemctl restart netfilter-persistent || echo "[!] netfilter-persistent not managed by systemctl"
-    else
-      echo "[!] Could not determine where to save iptables rules."
-    fi
+
+  elif [[ -d /etc/iptables ]]; then
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4
+    ip6tables-save > /etc/iptables/rules.v6
+
+  elif [[ -f /etc/sysconfig ]]; then
+    iptables-save > /etc/sysconfig/iptables
+
   else
-    echo "[!] Could not determine how to save iptables rules."
+    echo "[!] Could not find standard save location!"
   fi
+
+  echo "[✓] iptables saved."
 }
 
-
-# === Block port with WireGuard exception ===
+# === Add blocking rule ===
 block_port() {
   local PORT=$1
   local PROTO=$2
-  echo "[+] Blocking non-ID for port $PORT/$PROTO ..."
+  echo "[+] Blocking non-ID access for $PORT/$PROTO..."
   iptables -I INPUT -p $PROTO --dport $PORT -m set ! --match-set indonesia src ! -i wg0 -j DROP
   save_iptables
-  echo "[✓] Rule added and saved (WireGuard exempted)."
 }
 
 # === Remove rules ===
 remove_rules() {
-  echo "[+] Removing all GeoIP rules from INPUT chain..."
+  echo "[+] Removing all GeoIP rules..."
   iptables -L INPUT -n --line-numbers | grep match-set | awk '{print $1}' | sort -r | while read num; do
     iptables -D INPUT "$num"
   done
   save_iptables
-  echo "[✓] All GeoIP rules removed."
+  echo "[✓] Removed."
 }
 
 # === Check rules ===
 check_rules() {
-  echo "[+] Checking current GeoIP blocking rules..."
-  iptables -L INPUT -n --line-numbers | grep match-set || echo "No GeoIP rules found."
+  echo "[+] Current rules:"
+  iptables -L INPUT -n --line-numbers | grep match-set || echo "No rules."
 }
 
-# === Main Menu ===
+# === Menu ===
 create_ipset
 
 while true; do
@@ -152,11 +153,11 @@ while true; do
   echo "2) Block non-ID port 853"
   echo "3) Block both 53 & 853"
   echo "4) Block custom port"
-  echo "5) Check blocking rules"
-  echo "6) Remove all blocking"
+  echo "5) Check rules"
+  echo "6) Remove all rules"
   echo "7) Exit"
   echo "=============================="
-  read -p "Select option [1-7]: " choice
+  read -p "Choose [1-7]: " choice
 
   case $choice in
     1)
@@ -172,23 +173,22 @@ while true; do
       block_port 853 tcp
       ;;
     4)
-      read -p "Enter port number: " port
+      read -p "Port: " port
       read -p "Protocol (tcp/udp): " proto
       block_port $port $proto
       ;;
     5)
       check_rules
-      read -p "Press Enter to continue..."
+      read -p "Press Enter..."
       ;;
     6)
       remove_rules
       ;;
     7)
-      echo "Exiting..."
       exit 0
       ;;
     *)
-      echo "Invalid choice!"
+      echo "Invalid choice."
       sleep 1
       ;;
   esac
